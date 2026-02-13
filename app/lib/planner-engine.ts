@@ -147,6 +147,35 @@ export type Bounds = {
 };
 
 export const NODE_CAPTURE_RADIUS_METERS = 6.096;
+const OVERPASS_RUNNABLE_HIGHWAY_REGEX =
+  "residential|unclassified|tertiary|secondary|primary|living_street";
+const OVERPASS_TIMEOUT_SECONDS = 90;
+const OVERPASS_REQUEST_TIMEOUT_MS = 35_000;
+const NOMINATIM_REQUEST_TIMEOUT_MS = 14_000;
+const NOMINATIM_CACHE_TTL_MS = 1000 * 60 * 60 * 6;
+const OSM_LOAD_CACHE_TTL_MS = 1000 * 60 * 12;
+
+type NominatimGeo = {
+  bounds: CityBounds;
+  center: LatLng;
+  label: string;
+  boundary: CityBoundary | null;
+  queryUsed: string;
+  resolvedName: string;
+  likelyAutocorrected: boolean;
+};
+
+type CachedOSMLoad = {
+  streets: StreetSegment[];
+  sourceLabel: string;
+  cityBounds: CityBounds | null;
+};
+
+const nominatimGeoCache = new Map<
+  string,
+  { expiresAt: number; value: NominatimGeo | null }
+>();
+const osmLoadCache = new Map<string, { expiresAt: number; value: CachedOSMLoad }>();
 
 export const USERS_KEY = "streetsprint-users-v1";
 export const SESSION_COOKIE = "streetsprint-session";
@@ -1050,14 +1079,15 @@ export function matchActivityToStreets(
 
 export function buildOverpassAreaQuery(rawCity: string): string {
   const city = rawCity.replace(/"/g, "").trim();
+  const wayFilter = `["highway"~"^(${OVERPASS_RUNNABLE_HIGHWAY_REGEX})$"]["name"]["area"!="yes"]`;
   return `
-[out:json][timeout:120];
+[out:json][timeout:${OVERPASS_TIMEOUT_SECONDS}];
 (
-  area["name"="${city}"]["boundary"="administrative"]["admin_level"~"5|6|7|8|9"];
-  relation["name"="${city}"]["boundary"="administrative"];
+  area["name"="${city}"]["boundary"="administrative"]["admin_level"~"6|7|8|9"];
+  area["name"="${city}"]["place"~"city|town|municipality"];
 )->.searchArea;
 (
-  way["highway"](area.searchArea);
+  way${wayFilter}(area.searchArea);
 );
 out body;
 >;
@@ -1071,10 +1101,11 @@ export function buildOverpassBboxQuery(bounds: {
   west: number;
   east: number;
 }): string {
+  const wayFilter = `["highway"~"^(${OVERPASS_RUNNABLE_HIGHWAY_REGEX})$"]["name"]["area"!="yes"]`;
   return `
-[out:json][timeout:120];
+[out:json][timeout:${OVERPASS_TIMEOUT_SECONDS}];
 (
-  way["highway"](${bounds.south},${bounds.west},${bounds.north},${bounds.east});
+  way${wayFilter}(${bounds.south},${bounds.west},${bounds.north},${bounds.east});
 );
 out body;
 >;
@@ -1084,10 +1115,11 @@ out skel qt;
 
 export function buildOverpassAroundQuery(center: LatLng, radiusKm: number): string {
   const radiusMeters = Math.round(Math.max(1000, radiusKm * 1000));
+  const wayFilter = `["highway"~"^(${OVERPASS_RUNNABLE_HIGHWAY_REGEX})$"]["name"]["area"!="yes"]`;
   return `
-[out:json][timeout:120];
+[out:json][timeout:${OVERPASS_TIMEOUT_SECONDS}];
 (
-  way["highway"](around:${radiusMeters},${center.lat},${center.lon});
+  way${wayFilter}(around:${radiusMeters},${center.lat},${center.lon});
 );
 out body;
 >;
@@ -1316,13 +1348,139 @@ export function buildCityVariants(city: string): string[] {
   return Array.from(variants);
 }
 
-async function fetchNominatimGeo(city: string): Promise<{
-  bounds: CityBounds;
-  center: LatLng;
-  label: string;
-  boundary: CityBoundary | null;
-} | null> {
-  const url = `https://nominatim.openstreetmap.org/search?format=jsonv2&limit=8&polygon_geojson=1&q=${encodeURIComponent(city)}`;
+type NominatimEntry = {
+  lat?: string;
+  lon?: string;
+  display_name?: string;
+  name?: string;
+  boundingbox?: [string, string, string, string];
+  geojson?: unknown;
+  addresstype?: string;
+  type?: string;
+  place_rank?: number;
+};
+
+function normalizeCityText(value: string): string {
+  return value
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function primaryCityToken(label: string): string {
+  const first = label.split(",")[0] ?? label;
+  return first.trim();
+}
+
+function uniqueNonEmpty(values: string[]): string[] {
+  const seen = new Set<string>();
+  const result: string[] = [];
+
+  for (const value of values) {
+    const trimmed = value.trim();
+    if (!trimmed) {
+      continue;
+    }
+    const key = trimmed.toLowerCase();
+    if (seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    result.push(trimmed);
+  }
+
+  return result;
+}
+
+function levenshteinDistance(a: string, b: string): number {
+  if (a === b) {
+    return 0;
+  }
+  if (a.length === 0) {
+    return b.length;
+  }
+  if (b.length === 0) {
+    return a.length;
+  }
+
+  let previous = new Array<number>(b.length + 1);
+  let current = new Array<number>(b.length + 1);
+
+  for (let j = 0; j <= b.length; j += 1) {
+    previous[j] = j;
+  }
+
+  for (let i = 1; i <= a.length; i += 1) {
+    current[0] = i;
+
+    for (let j = 1; j <= b.length; j += 1) {
+      const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+      const deletion = previous[j] + 1;
+      const insertion = current[j - 1] + 1;
+      const substitution = previous[j - 1] + cost;
+      current[j] = Math.min(deletion, insertion, substitution);
+    }
+
+    [previous, current] = [current, previous];
+  }
+
+  return previous[b.length];
+}
+
+function normalizedEditDistance(a: string, b: string): number {
+  const left = normalizeCityText(a);
+  const right = normalizeCityText(b);
+  if (!left && !right) {
+    return 0;
+  }
+  const maxLength = Math.max(left.length, right.length, 1);
+  return levenshteinDistance(left, right) / maxLength;
+}
+
+function cloneStreetSegments(streets: StreetSegment[]): StreetSegment[] {
+  return streets.map((street) => ({
+    ...street,
+    path: street.path.map((point) => ({ ...point })),
+  }));
+}
+
+function cloneCityBounds(bounds: CityBounds | null): CityBounds | null {
+  if (!bounds) {
+    return null;
+  }
+  return { ...bounds };
+}
+
+function cloneCachedOSMLoad(value: CachedOSMLoad): CachedOSMLoad {
+  return {
+    streets: cloneStreetSegments(value.streets),
+    sourceLabel: value.sourceLabel,
+    cityBounds: cloneCityBounds(value.cityBounds),
+  };
+}
+
+function readCachedOSMLoad(cityKey: string): CachedOSMLoad | null {
+  const cached = osmLoadCache.get(cityKey);
+  if (!cached) {
+    return null;
+  }
+  if (cached.expiresAt <= Date.now()) {
+    osmLoadCache.delete(cityKey);
+    return null;
+  }
+  return cloneCachedOSMLoad(cached.value);
+}
+
+function writeCachedOSMLoad(cityKey: string, value: CachedOSMLoad): void {
+  osmLoadCache.set(cityKey, {
+    expiresAt: Date.now() + OSM_LOAD_CACHE_TTL_MS,
+    value: cloneCachedOSMLoad(value),
+  });
+}
+
+async function fetchNominatimPayload(query: string): Promise<NominatimEntry[]> {
+  const url = `https://nominatim.openstreetmap.org/search?format=jsonv2&limit=10&polygon_geojson=1&addressdetails=1&q=${encodeURIComponent(query)}`;
   const response = await fetchWithTimeout(
     url,
     {
@@ -1330,58 +1488,95 @@ async function fetchNominatimGeo(city: string): Promise<{
         Accept: "application/json",
       },
     },
-    20_000,
+    NOMINATIM_REQUEST_TIMEOUT_MS,
   );
   if (!response.ok) {
+    return [];
+  }
+
+  const payload = (await response.json()) as unknown;
+  if (!Array.isArray(payload)) {
+    return [];
+  }
+  return payload as NominatimEntry[];
+}
+
+async function fetchNominatimGeo(city: string): Promise<NominatimGeo | null> {
+  const rawCity = city.trim();
+  if (!rawCity) {
     return null;
   }
 
-  const payload = (await response.json()) as Array<{
-    lat?: string;
-    lon?: string;
-    display_name?: string;
-    boundingbox?: [string, string, string, string];
-    geojson?: unknown;
-    addresstype?: string;
-    type?: string;
-    place_rank?: number;
-  }>;
+  const cacheKey = normalizeCityText(rawCity);
+  const cached = nominatimGeoCache.get(cacheKey);
+  if (cached && cached.expiresAt > Date.now()) {
+    return cached.value;
+  }
 
-  if (!Array.isArray(payload) || payload.length === 0) {
+  const cityPart = rawCity.split(",")[0]?.trim() ?? rawCity;
+  const attempts = uniqueNonEmpty([
+    rawCity,
+    cityPart,
+    `${cityPart}, USA`,
+    `${rawCity}, USA`,
+  ]);
+
+  let payload: NominatimEntry[] = [];
+  let queryUsed = rawCity;
+
+  for (const attempt of attempts) {
+    payload = await fetchNominatimPayload(attempt);
+    if (payload.length > 0) {
+      queryUsed = attempt;
+      break;
+    }
+  }
+
+  if (payload.length === 0) {
+    nominatimGeoCache.set(cacheKey, {
+      expiresAt: Date.now() + NOMINATIM_CACHE_TTL_MS,
+      value: null,
+    });
     return null;
   }
 
-  const normalizedQuery = city.trim().toLowerCase();
-  const cityToken = normalizedQuery.split(",")[0]?.trim() ?? normalizedQuery;
+  const queryToken = normalizeCityText(cityPart);
 
   const ranked = payload
     .map((entry) => {
       const addresstype = entry.addresstype?.toLowerCase() ?? "";
       const type = entry.type?.toLowerCase() ?? "";
       const label = entry.display_name?.toLowerCase() ?? "";
+      const candidateName = entry.name?.trim() || (entry.display_name?.split(",")[0] ?? "");
+      const candidateToken = normalizeCityText(candidateName);
       const placeRank =
         typeof entry.place_rank === "number" ? entry.place_rank : Number.POSITIVE_INFINITY;
 
+      const editDistance = normalizedEditDistance(queryToken, candidateToken);
+      const similarity = 1 - editDistance;
+
       let score = 0;
-      if (label.startsWith(cityToken)) {
-        score += 42;
+      score += Math.max(-25, similarity * 95);
+
+      if (queryToken && label.includes(queryToken)) {
+        score += 18;
       }
-      if (label.includes(cityToken)) {
-        score += 12;
+      if (candidateToken === queryToken) {
+        score += 36;
       }
 
       if (["city", "town", "municipality"].includes(addresstype)) {
         score += 120;
       } else if (["village", "borough", "suburb", "hamlet"].includes(addresstype)) {
-        score += 72;
+        score += 74;
       } else if (["county", "state", "region", "country"].includes(addresstype)) {
-        score -= 130;
+        score -= 132;
       }
 
       if (["city", "town", "municipality"].includes(type)) {
         score += 55;
       } else if (type === "administrative") {
-        score += 8;
+        score += 10;
       }
 
       if (Number.isFinite(placeRank)) {
@@ -1391,6 +1586,7 @@ async function fetchNominatimGeo(city: string): Promise<{
       return {
         entry,
         score,
+        editDistance,
       };
     })
     .sort((a, b) => b.score - a.score);
@@ -1400,6 +1596,7 @@ async function fetchNominatimGeo(city: string): Promise<{
         lat?: string;
         lon?: string;
         display_name?: string;
+        name?: string;
         boundingbox?: [string, string, string, string];
         geojson?: unknown;
       }
@@ -1436,6 +1633,10 @@ async function fetchNominatimGeo(city: string): Promise<{
   }
 
   if (!chosen?.boundingbox || chosen.boundingbox.length < 4) {
+    nominatimGeoCache.set(cacheKey, {
+      expiresAt: Date.now() + NOMINATIM_CACHE_TTL_MS,
+      value: null,
+    });
     return null;
   }
 
@@ -1459,7 +1660,17 @@ async function fetchNominatimGeo(city: string): Promise<{
     return null;
   }
 
-  return {
+  const resolvedName =
+    chosen.name?.trim() ||
+    primaryCityToken(chosen.display_name?.trim() || cityPart) ||
+    cityPart;
+  const likelyAutocorrected =
+    queryToken.length >= 3 &&
+    normalizeCityText(resolvedName).length >= 3 &&
+    queryToken !== normalizeCityText(resolvedName) &&
+    normalizedEditDistance(queryToken, normalizeCityText(resolvedName)) <= 0.45;
+
+  const value: NominatimGeo = {
     bounds: {
       south,
       north,
@@ -1470,42 +1681,57 @@ async function fetchNominatimGeo(city: string): Promise<{
       lat: centerLat,
       lon: centerLon,
     },
-    label: chosen.display_name?.trim() || city,
+    label: chosen.display_name?.trim() || rawCity,
     boundary: parseCityBoundaryGeoJson(chosen.geojson),
+    queryUsed,
+    resolvedName: resolvedName || cityPart,
+    likelyAutocorrected,
   };
+
+  nominatimGeoCache.set(cacheKey, {
+    expiresAt: Date.now() + NOMINATIM_CACHE_TTL_MS,
+    value,
+  });
+
+  return value;
 }
 
 async function requestOverpass(query: string): Promise<OverpassPayload> {
-  const failures: string[] = [];
-
-  for (const endpoint of OVERPASS_ENDPOINTS) {
-    try {
-      const response = await fetchWithTimeout(
-        endpoint,
-        {
-          method: "POST",
-          body: query,
-          headers: {
-            "Content-Type": "text/plain;charset=UTF-8",
-            Accept: "application/json",
-          },
+  const attempts = OVERPASS_ENDPOINTS.map(async (endpoint) => {
+    const response = await fetchWithTimeout(
+      endpoint,
+      {
+        method: "POST",
+        body: query,
+        headers: {
+          "Content-Type": "text/plain;charset=UTF-8",
+          Accept: "application/json",
         },
-        55_000,
-      );
+      },
+      OVERPASS_REQUEST_TIMEOUT_MS,
+    );
 
-      if (!response.ok) {
-        failures.push(`${new URL(endpoint).host} (${response.status})`);
-        continue;
-      }
-
-      return (await response.json()) as OverpassPayload;
-    } catch (error) {
-      const text = error instanceof Error ? error.message : "request failed";
-      failures.push(`${new URL(endpoint).host} (${text})`);
+    if (!response.ok) {
+      throw new Error(`${new URL(endpoint).host} (${response.status})`);
     }
-  }
 
-  throw new Error(`All Overpass endpoints failed: ${failures.join("; ")}`);
+    return (await response.json()) as OverpassPayload;
+  });
+
+  try {
+    return await Promise.any(attempts);
+  } catch {
+    const settled = await Promise.allSettled(attempts);
+    const failures = settled.map((result, index) => {
+      if (result.status === "fulfilled") {
+        return `${new URL(OVERPASS_ENDPOINTS[index]).host} (unknown error)`;
+      }
+      const reason =
+        result.reason instanceof Error ? result.reason.message : "request failed";
+      return `${new URL(OVERPASS_ENDPOINTS[index]).host} (${reason})`;
+    });
+    throw new Error(`All Overpass endpoints failed: ${failures.join("; ")}`);
+  }
 }
 
 export async function loadStreetsFromOSM(city: string): Promise<{
@@ -1513,117 +1739,130 @@ export async function loadStreetsFromOSM(city: string): Promise<{
   sourceLabel: string;
   cityBounds: CityBounds | null;
 }> {
-  const variants = buildCityVariants(city);
-  const areaResults: Array<{
-    variant: string;
-    streets: StreetSegment[];
-  }> = [];
-
-  for (const variant of variants) {
-    try {
-      const areaPayload = await requestOverpass(buildOverpassAreaQuery(variant));
-      const areaStreets = parseOverpassResponse(areaPayload);
-      areaResults.push({
-        variant,
-        streets: areaStreets,
-      });
-    } catch {
-      continue;
-    }
+  const rawCity = city.trim();
+  if (!rawCity) {
+    throw new Error("Enter a city first.");
   }
 
-  const bestAreaResult = areaResults
-    .slice()
-    .sort((a, b) => b.streets.length - a.streets.length)[0];
-  const bestAreaStreets = bestAreaResult?.streets ?? [];
-  const bestAreaLabel = bestAreaResult
-    ? `OpenStreetMap area (${bestAreaResult.variant})`
-    : `OpenStreetMap area (${city})`;
+  const cacheKey = normalizeCityText(rawCity);
+  const cached = readCachedOSMLoad(cacheKey);
+  if (cached) {
+    return cached;
+  }
 
-  let nominatimGeo: Awaited<ReturnType<typeof fetchNominatimGeo>> = null;
-  for (const variant of variants) {
-    nominatimGeo = await fetchNominatimGeo(variant);
-    if (nominatimGeo) {
-      break;
+  let nominatimGeo: NominatimGeo | null = await fetchNominatimGeo(rawCity);
+  if (!nominatimGeo) {
+    const quickFallbacks = uniqueNonEmpty([
+      rawCity.split(",")[0] ?? rawCity,
+      ...buildCityVariants(rawCity).slice(0, 2),
+    ]);
+    for (const fallback of quickFallbacks) {
+      nominatimGeo = await fetchNominatimGeo(fallback);
+      if (nominatimGeo) {
+        break;
+      }
     }
   }
 
   if (!nominatimGeo) {
-    if (bestAreaStreets.length > 0) {
-      return {
-        streets: bestAreaStreets,
-        sourceLabel: bestAreaLabel,
-        cityBounds: null,
-      };
-    }
     throw new Error(
       "Could not resolve city bounds. Try entering city + state (example: San Luis Obispo, CA).",
     );
-  }
-
-  let bboxStreets: StreetSegment[] = [];
-  let aroundStreets: StreetSegment[] = [];
-
-  try {
-    const bboxPayload = await requestOverpass(
-      buildOverpassBboxQuery(nominatimGeo.bounds),
-    );
-    bboxStreets = parseOverpassResponse(bboxPayload);
-  } catch {
-    bboxStreets = [];
-  }
-
-  const diagonalKm = haversineKm(
-    { lat: nominatimGeo.bounds.south, lon: nominatimGeo.bounds.west },
-    { lat: nominatimGeo.bounds.north, lon: nominatimGeo.bounds.east },
-  );
-  const aroundRadiusKm = Math.max(5, Math.min(24, diagonalKm * 0.32));
-
-  try {
-    const aroundPayload = await requestOverpass(
-      buildOverpassAroundQuery(nominatimGeo.center, aroundRadiusKm),
-    );
-    aroundStreets = parseOverpassResponse(aroundPayload);
-  } catch {
-    aroundStreets = [];
   }
 
   const constrainToCityLimits = (input: StreetSegment[]): StreetSegment[] => {
     if (nominatimGeo.boundary) {
       const polygonFiltered = filterStreetsToCityBoundary(input, nominatimGeo.boundary);
       if (polygonFiltered.length > 0) {
-        return polygonFiltered;
+        return dedupeByName(polygonFiltered);
       }
     }
-    return filterStreetsToCityBounds(input, nominatimGeo.bounds);
+    return dedupeByName(filterStreetsToCityBounds(input, nominatimGeo.bounds));
   };
+
+  const requestedCityToken = normalizeCityText(rawCity.split(",")[0] ?? rawCity);
+  const resolvedCityToken = normalizeCityText(nominatimGeo.resolvedName);
+  const queryWasGuessed =
+    nominatimGeo.likelyAutocorrected ||
+    (requestedCityToken.length >= 3 &&
+      resolvedCityToken.length >= 3 &&
+      requestedCityToken !== resolvedCityToken &&
+      normalizedEditDistance(requestedCityToken, resolvedCityToken) <= 0.45);
 
   const boundaryLabel = nominatimGeo.boundary
     ? "administrative boundary"
     : "city bounds fallback";
+  const guessSuffix = queryWasGuessed
+    ? ` (interpreted query as "${nominatimGeo.label}")`
+    : "";
+
+  const diagonalKm = haversineKm(
+    { lat: nominatimGeo.bounds.south, lon: nominatimGeo.bounds.west },
+    { lat: nominatimGeo.bounds.north, lon: nominatimGeo.bounds.east },
+  );
+  const aroundRadiusKm = Math.max(4, Math.min(22, diagonalKm * 0.3));
+  const quickAcceptThreshold = Math.max(24, Math.min(170, Math.round(diagonalKm * 5.5)));
+
+  const bboxPromise = requestOverpass(buildOverpassBboxQuery(nominatimGeo.bounds))
+    .then(parseOverpassResponse)
+    .catch(() => []);
+  const aroundPromise = requestOverpass(
+    buildOverpassAroundQuery(nominatimGeo.center, aroundRadiusKm),
+  )
+    .then(parseOverpassResponse)
+    .catch(() => []);
+  const areaTarget = uniqueNonEmpty([
+    nominatimGeo.resolvedName,
+    rawCity.split(",")[0] ?? rawCity,
+  ])[0];
+  const areaPromise = areaTarget
+    ? requestOverpass(buildOverpassAreaQuery(areaTarget))
+        .then(parseOverpassResponse)
+        .catch(() => [])
+    : Promise.resolve<StreetSegment[]>([]);
+
+  const bboxStreets = constrainToCityLimits(await bboxPromise);
+  if (bboxStreets.length >= quickAcceptThreshold) {
+    const fastResult: CachedOSMLoad = {
+      streets: bboxStreets,
+      sourceLabel: `OpenStreetMap bbox (${nominatimGeo.label}) constrained to ${boundaryLabel}${guessSuffix}`,
+      cityBounds: nominatimGeo.bounds,
+    };
+    writeCachedOSMLoad(cacheKey, fastResult);
+    return cloneCachedOSMLoad(fastResult);
+  }
+
+  const [aroundStreetsRaw, areaStreetsRaw] = await Promise.all([
+    aroundPromise,
+    areaPromise,
+  ]);
+  const aroundStreets = constrainToCityLimits(aroundStreetsRaw);
+  const areaStreets = constrainToCityLimits(areaStreetsRaw);
 
   const winners = [
     {
-      streets: constrainToCityLimits(bestAreaStreets),
-      label: `${bestAreaLabel} constrained to ${boundaryLabel}`,
+      streets: bboxStreets,
+      label: `OpenStreetMap bbox (${nominatimGeo.label}) constrained to ${boundaryLabel}${guessSuffix}`,
     },
     {
-      streets: constrainToCityLimits(bboxStreets),
-      label: `OpenStreetMap bbox fallback (${nominatimGeo.label}) constrained to ${boundaryLabel}`,
+      streets: areaStreets,
+      label: `OpenStreetMap area (${areaTarget ?? nominatimGeo.resolvedName}) constrained to ${boundaryLabel}${guessSuffix}`,
     },
     {
-      streets: constrainToCityLimits(aroundStreets),
-      label: `OpenStreetMap center-radius fallback (${nominatimGeo.label}) constrained to ${boundaryLabel}`,
+      streets: aroundStreets,
+      label: `OpenStreetMap center-radius fallback (${nominatimGeo.label}) constrained to ${boundaryLabel}${guessSuffix}`,
     },
   ].sort((a, b) => b.streets.length - a.streets.length);
 
   const best = winners[0];
   if (best.streets.length > 0) {
-    return {
+    const bestResult: CachedOSMLoad = {
       streets: best.streets,
       sourceLabel: best.label,
       cityBounds: nominatimGeo.bounds,
     };
+    writeCachedOSMLoad(cacheKey, bestResult);
+    return cloneCachedOSMLoad(bestResult);
   }
 
   throw new Error(
@@ -1737,6 +1976,234 @@ export function buildStreetGraph(streets: StreetSegment[]): StreetGraph {
   }
 
   return { nodes, edges, adjacency };
+}
+
+type EquivalentCoverageIndex = {
+  equivalentStreetIdsByStreetId: Map<string, Set<string>>;
+  equivalentNodeIdsByStreetId: Map<string, Set<string>>;
+};
+
+type EdgeSimilarityMeta = {
+  streetId: string;
+  fromNodeId: string;
+  toNodeId: string;
+  fromPoint: LatLng;
+  toPoint: LatLng;
+  midpoint: LatLng;
+  orientationDeg: number;
+  distanceKm: number;
+};
+
+function edgeMidpoint(a: LatLng, b: LatLng): LatLng {
+  return {
+    lat: (a.lat + b.lat) / 2,
+    lon: (a.lon + b.lon) / 2,
+  };
+}
+
+function edgeOrientationDegrees(a: LatLng, b: LatLng): number {
+  const originLat = (a.lat + b.lat) / 2;
+  const ap = toMeters(a.lat, a.lon, originLat);
+  const bp = toMeters(b.lat, b.lon, originLat);
+  const angle = (Math.atan2(bp.y - ap.y, bp.x - ap.x) * 180) / Math.PI;
+  return (angle + 360) % 180;
+}
+
+function orientationDeltaDegrees(a: number, b: number): number {
+  let diff = Math.abs(a - b) % 180;
+  if (diff > 90) {
+    diff = 180 - diff;
+  }
+  return diff;
+}
+
+function minEndpointDistanceMeters(
+  point: LatLng,
+  candidateA: LatLng,
+  candidateB: LatLng,
+): number {
+  return Math.min(
+    haversineKm(point, candidateA) * 1000,
+    haversineKm(point, candidateB) * 1000,
+  );
+}
+
+function isEquivalentParallelStreetSegment(
+  left: EdgeSimilarityMeta,
+  right: EdgeSimilarityMeta,
+): boolean {
+  const midpointMeters = haversineKm(left.midpoint, right.midpoint) * 1000;
+  if (midpointMeters > 55) {
+    return false;
+  }
+
+  if (orientationDeltaDegrees(left.orientationDeg, right.orientationDeg) > 20) {
+    return false;
+  }
+
+  const shorter = Math.max(0.01, Math.min(left.distanceKm, right.distanceKm));
+  const longer = Math.max(left.distanceKm, right.distanceKm);
+  if (longer / shorter > 2.5) {
+    return false;
+  }
+
+  const leftStartNearMeters = minEndpointDistanceMeters(
+    left.fromPoint,
+    right.fromPoint,
+    right.toPoint,
+  );
+  const leftEndNearMeters = minEndpointDistanceMeters(
+    left.toPoint,
+    right.fromPoint,
+    right.toPoint,
+  );
+  if (leftStartNearMeters > 80 || leftEndNearMeters > 80) {
+    return false;
+  }
+
+  return true;
+}
+
+function buildEquivalentCoverageIndex(graph: StreetGraph): EquivalentCoverageIndex {
+  const equivalentStreetIdsByStreetId = new Map<string, Set<string>>();
+  const equivalentNodeIdsByStreetId = new Map<string, Set<string>>();
+  const byStreetName = new Map<string, EdgeSimilarityMeta[]>();
+
+  for (const edge of graph.edges.values()) {
+    const fromNode = graph.nodes.get(edge.from);
+    const toNode = graph.nodes.get(edge.to);
+    if (!fromNode || !toNode) {
+      continue;
+    }
+
+    const nameKey = normalizeStreetName(edge.streetName);
+    if (!nameKey) {
+      continue;
+    }
+
+    const meta: EdgeSimilarityMeta = {
+      streetId: edge.streetId,
+      fromNodeId: edge.from,
+      toNodeId: edge.to,
+      fromPoint: fromNode.point,
+      toPoint: toNode.point,
+      midpoint: edgeMidpoint(fromNode.point, toNode.point),
+      orientationDeg: edgeOrientationDegrees(fromNode.point, toNode.point),
+      distanceKm: edge.distanceKm,
+    };
+
+    if (!byStreetName.has(nameKey)) {
+      byStreetName.set(nameKey, []);
+    }
+    byStreetName.get(nameKey)?.push(meta);
+  }
+
+  for (const metas of byStreetName.values()) {
+    if (metas.length < 2) {
+      continue;
+    }
+
+    const bucketSizeDeg = 0.0015;
+    const bucketMap = new Map<string, EdgeSimilarityMeta[]>();
+
+    const bucketKey = (point: LatLng) =>
+      `${Math.round(point.lat / bucketSizeDeg)}:${Math.round(point.lon / bucketSizeDeg)}`;
+
+    for (const meta of metas) {
+      const key = bucketKey(meta.midpoint);
+      if (!bucketMap.has(key)) {
+        bucketMap.set(key, []);
+      }
+      bucketMap.get(key)?.push(meta);
+    }
+
+    const aliasByStreetId = new Map<string, Set<string>>();
+    const nodeAliasByStreetId = new Map<string, Set<string>>();
+
+    const addAlias = (left: EdgeSimilarityMeta, right: EdgeSimilarityMeta) => {
+      if (!aliasByStreetId.has(left.streetId)) {
+        aliasByStreetId.set(left.streetId, new Set<string>());
+      }
+      if (!aliasByStreetId.has(right.streetId)) {
+        aliasByStreetId.set(right.streetId, new Set<string>());
+      }
+      aliasByStreetId.get(left.streetId)?.add(right.streetId);
+      aliasByStreetId.get(right.streetId)?.add(left.streetId);
+
+      if (!nodeAliasByStreetId.has(left.streetId)) {
+        nodeAliasByStreetId.set(left.streetId, new Set<string>());
+      }
+      if (!nodeAliasByStreetId.has(right.streetId)) {
+        nodeAliasByStreetId.set(right.streetId, new Set<string>());
+      }
+
+      const leftNodes = nodeAliasByStreetId.get(left.streetId);
+      leftNodes?.add(left.fromNodeId);
+      leftNodes?.add(left.toNodeId);
+      leftNodes?.add(right.fromNodeId);
+      leftNodes?.add(right.toNodeId);
+
+      const rightNodes = nodeAliasByStreetId.get(right.streetId);
+      rightNodes?.add(left.fromNodeId);
+      rightNodes?.add(left.toNodeId);
+      rightNodes?.add(right.fromNodeId);
+      rightNodes?.add(right.toNodeId);
+    };
+
+    for (const meta of metas) {
+      const latBucket = Math.round(meta.midpoint.lat / bucketSizeDeg);
+      const lonBucket = Math.round(meta.midpoint.lon / bucketSizeDeg);
+
+      for (let dLat = -1; dLat <= 1; dLat += 1) {
+        for (let dLon = -1; dLon <= 1; dLon += 1) {
+          const key = `${latBucket + dLat}:${lonBucket + dLon}`;
+          const candidates = bucketMap.get(key) ?? [];
+
+          for (const candidate of candidates) {
+            if (candidate.streetId <= meta.streetId) {
+              continue;
+            }
+
+            if (!isEquivalentParallelStreetSegment(meta, candidate)) {
+              continue;
+            }
+
+            addAlias(meta, candidate);
+          }
+        }
+      }
+    }
+
+    for (const [streetId, aliasStreetIds] of aliasByStreetId.entries()) {
+      if (aliasStreetIds.size === 0) {
+        continue;
+      }
+
+      if (!equivalentStreetIdsByStreetId.has(streetId)) {
+        equivalentStreetIdsByStreetId.set(streetId, new Set<string>());
+      }
+      const mergedStreetIds = equivalentStreetIdsByStreetId.get(streetId);
+      for (const aliasStreetId of aliasStreetIds) {
+        mergedStreetIds?.add(aliasStreetId);
+      }
+
+      const aliasNodeIds = nodeAliasByStreetId.get(streetId);
+      if (aliasNodeIds && aliasNodeIds.size > 0) {
+        if (!equivalentNodeIdsByStreetId.has(streetId)) {
+          equivalentNodeIdsByStreetId.set(streetId, new Set<string>());
+        }
+        const mergedNodes = equivalentNodeIdsByStreetId.get(streetId);
+        for (const nodeId of aliasNodeIds) {
+          mergedNodes?.add(nodeId);
+        }
+      }
+    }
+  }
+
+  return {
+    equivalentStreetIdsByStreetId,
+    equivalentNodeIdsByStreetId,
+  };
 }
 
 export class MinHeap<T> {
@@ -2421,23 +2888,40 @@ function applyTraversalStep(
   rewardedStreetIds: Set<string>,
   coveredNodes: Set<string>,
   traversedEdgeCount: Map<string, number>,
+  equivalentStreetIdsByStreetId: Map<string, Set<string>>,
+  equivalentNodeIdsByStreetId: Map<string, Set<string>>,
 ): { nextNodeId: string; distanceKm: number } | null {
   const append = appendRouteStep(graph, step, routePoints);
   if (!append) {
     return null;
   }
 
-  coveredStreetIds.add(append.edge.streetId);
+  const markStreetCovered = (streetId: string) => {
+    coveredStreetIds.add(streetId);
+    if (!(completedByStreetId.get(streetId) ?? false)) {
+      rewardedStreetIds.add(streetId);
+    }
+  };
+
+  markStreetCovered(append.edge.streetId);
+  for (const equivalentStreetId of equivalentStreetIdsByStreetId.get(
+    append.edge.streetId,
+  ) ?? []) {
+    markStreetCovered(equivalentStreetId);
+  }
+
   coveredStreetNames.add(append.edge.streetName);
   coveredNodes.add(step.from);
   coveredNodes.add(step.to);
+  for (const equivalentNodeId of equivalentNodeIdsByStreetId.get(append.edge.streetId) ??
+    []) {
+    coveredNodes.add(equivalentNodeId);
+  }
+
   traversedEdgeCount.set(
     append.edge.id,
     (traversedEdgeCount.get(append.edge.id) ?? 0) + 1,
   );
-  if (!(completedByStreetId.get(append.edge.streetId) ?? false)) {
-    rewardedStreetIds.add(append.edge.streetId);
-  }
 
   return {
     nextNodeId: step.to,
@@ -2836,6 +3320,18 @@ function findBestLocalExtension(
   coveredNodes: Set<string>,
 ): RouteTraversalStep | null {
   const neighbors = graph.adjacency.get(currentNodeId) ?? [];
+  const hasFreshOption = neighbors.some((neighbor) => {
+    const edge = graph.edges.get(neighbor.edgeId);
+    if (!edge) {
+      return false;
+    }
+    if ((traversedEdgeCount.get(edge.id) ?? 0) > 0) {
+      return false;
+    }
+    const isCompleted = completedByStreetId.get(edge.streetId) ?? false;
+    const isNewReward = !isCompleted && !rewardedStreetIds.has(edge.streetId);
+    return isNewReward;
+  });
   let best: { step: RouteTraversalStep; score: number } | null = null;
 
   for (const neighbor of neighbors) {
@@ -2850,6 +3346,9 @@ function findBestLocalExtension(
     }
 
     const repeatCount = traversedEdgeCount.get(edge.id) ?? 0;
+    if (hasFreshOption && repeatCount > 0) {
+      continue;
+    }
     const isCompleted = completedByStreetId.get(edge.streetId) ?? false;
     const isNewReward = !isCompleted && !rewardedStreetIds.has(edge.streetId);
     const nodeGain = coveredNodes.has(neighbor.neighbor) ? 0 : 1;
@@ -2899,6 +3398,7 @@ export function buildEfficientCoverageRoute(
   if (graph.edges.size === 0 || graph.nodes.size === 0) {
     return null;
   }
+  const equivalentCoverageIndex = buildEquivalentCoverageIndex(graph);
 
   const startNodeId = findNearestNodeId(graph.nodes, home);
   if (!startNodeId) {
@@ -2964,6 +3464,8 @@ export function buildEfficientCoverageRoute(
           rewardedStreetIds,
           coveredNodes,
           traversedEdgeCount,
+          equivalentCoverageIndex.equivalentStreetIdsByStreetId,
+          equivalentCoverageIndex.equivalentNodeIdsByStreetId,
         );
         if (!applied) {
           failedSpur = true;
@@ -3012,6 +3514,8 @@ export function buildEfficientCoverageRoute(
         rewardedStreetIds,
         coveredNodes,
         traversedEdgeCount,
+        equivalentCoverageIndex.equivalentStreetIdsByStreetId,
+        equivalentCoverageIndex.equivalentNodeIdsByStreetId,
       );
       if (!applied) {
         break;
@@ -3082,6 +3586,8 @@ export function buildEfficientCoverageRoute(
         rewardedStreetIds,
         coveredNodes,
         traversedEdgeCount,
+        equivalentCoverageIndex.equivalentStreetIdsByStreetId,
+        equivalentCoverageIndex.equivalentNodeIdsByStreetId,
       );
       if (!localAppend) {
         break;
@@ -3116,6 +3622,8 @@ export function buildEfficientCoverageRoute(
         rewardedStreetIds,
         coveredNodes,
         traversedEdgeCount,
+        equivalentCoverageIndex.equivalentStreetIdsByStreetId,
+        equivalentCoverageIndex.equivalentNodeIdsByStreetId,
       );
       if (!connectorAppend) {
         aborted = true;
@@ -3155,6 +3663,8 @@ export function buildEfficientCoverageRoute(
       rewardedStreetIds,
       coveredNodes,
       traversedEdgeCount,
+      equivalentCoverageIndex.equivalentStreetIdsByStreetId,
+      equivalentCoverageIndex.equivalentNodeIdsByStreetId,
     );
     if (!targetAppend) {
       break;
@@ -3178,7 +3688,9 @@ export function buildEfficientCoverageRoute(
     id: node.id,
     point: node.point,
   }));
-  const coveredNodeIds = coveredNodeIdsForPath(routePoints, availableNodes);
+  const coveredNodeIds = Array.from(
+    new Set([...coveredNodeIdsForPath(routePoints, availableNodes), ...coveredNodes]),
+  );
   const coveredNodePoints = coveredNodeIds
     .map((id) => graph.nodes.get(id)?.point)
     .filter((point): point is LatLng => point !== undefined);
@@ -3273,6 +3785,97 @@ export function downloadTextFile(filename: string, content: string): void {
   URL.revokeObjectURL(url);
 }
 
+function sampleIndices(length: number, maxItems: number): number[] {
+  if (length <= 0 || maxItems <= 0) {
+    return [];
+  }
+  if (length <= maxItems) {
+    return Array.from({ length }, (_, index) => index);
+  }
+  if (maxItems === 1) {
+    return [Math.floor(length / 2)];
+  }
+
+  const step = (length - 1) / (maxItems - 1);
+  const indices: number[] = [];
+  let last = -1;
+
+  for (let i = 0; i < maxItems; i += 1) {
+    const candidate = Math.max(0, Math.min(length - 1, Math.round(i * step)));
+    if (candidate === last) {
+      continue;
+    }
+    indices.push(candidate);
+    last = candidate;
+  }
+
+  return indices;
+}
+
+function samplePoints(points: LatLng[], maxItems: number): LatLng[] {
+  const indices = sampleIndices(points.length, maxItems);
+  return indices.map((index) => points[index]);
+}
+
+function dedupeNearbyPoints(points: LatLng[], minMeters: number): LatLng[] {
+  if (points.length === 0) {
+    return points;
+  }
+
+  const deduped: LatLng[] = [points[0]];
+  for (let i = 1; i < points.length; i += 1) {
+    if (haversineKm(deduped[deduped.length - 1], points[i]) * 1000 < minMeters) {
+      continue;
+    }
+    deduped.push(points[i]);
+  }
+  return deduped;
+}
+
+function orderNodeStopsAlongRoute(route: SuggestedRoute): LatLng[] {
+  if (route.nodePoints.length === 0 || route.points.length < 2) {
+    return [];
+  }
+
+  const origin = route.points[0];
+  const destination = route.points[route.points.length - 1];
+  const routeSampleIndices = sampleIndices(route.points.length, Math.min(1700, route.points.length));
+  const routeSamples = routeSampleIndices.map((index) => route.points[index]);
+
+  const ordered = route.nodePoints
+    .filter(
+      (point) =>
+        haversineKm(point, origin) * 1000 > 18 &&
+        haversineKm(point, destination) * 1000 > 18,
+    )
+    .map((point, index) => {
+      let bestSampleIndex = 0;
+      let bestDistance = Number.POSITIVE_INFINITY;
+
+      for (let i = 0; i < routeSamples.length; i += 1) {
+        const distance = haversineKm(point, routeSamples[i]);
+        if (distance < bestDistance) {
+          bestDistance = distance;
+          bestSampleIndex = i;
+        }
+      }
+
+      return {
+        point,
+        orderIndex: routeSampleIndices[bestSampleIndex] ?? 0,
+        index,
+      };
+    })
+    .sort((a, b) => a.orderIndex - b.orderIndex || a.index - b.index)
+    .map((entry) => entry.point);
+
+  return dedupeNearbyPoints(ordered, 14);
+}
+
+function formatWaypoint(point: LatLng): string {
+  return `${point.lat.toFixed(6)},${point.lon.toFixed(6)}`;
+}
+
 export function buildDirectAppRouteUrl(
   route: SuggestedRoute,
   app: IntegrationKey,
@@ -3284,15 +3887,14 @@ export function buildDirectAppRouteUrl(
   if (app === "google_maps") {
     const origin = route.points[0];
     const destination = route.points[route.points.length - 1];
-    const middle = route.points
-      .slice(1, route.points.length - 1)
-      .filter(
-        (_, index) =>
-          index % Math.max(1, Math.ceil(route.points.length / 10)) === 0,
-      )
-      .slice(0, 10)
-      .map((point) => `${point.lat},${point.lon}`)
-      .join("|");
+    const maxWaypoints = 23;
+    const nodeWaypoints = orderNodeStopsAlongRoute(route);
+    const fallbackWaypoints = samplePoints(route.points.slice(1, route.points.length - 1), maxWaypoints);
+    const selectedWaypoints = samplePoints(
+      nodeWaypoints.length > 0 ? nodeWaypoints : fallbackWaypoints,
+      maxWaypoints,
+    );
+    const middle = selectedWaypoints.map(formatWaypoint).join("|");
 
     const waypoints = middle.length > 0 ? `&waypoints=${encodeURIComponent(middle)}` : "";
 
