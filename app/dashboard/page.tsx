@@ -1,5 +1,5 @@
 import PlannerApp from "@/app/components/planner/PlannerApp";
 
-export default function HomePage() {
+export default function DashboardPage() {
   return <PlannerApp />;
 }
